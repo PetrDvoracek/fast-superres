@@ -11,12 +11,20 @@
 
 # training parameters
 
+NAME = "0_sample_div2k+flickr2k"
+
 # %%
 batch_size = 64
 num_workers = 16
 num_epoch = 100
 learning_rate = 1e-3
 
+import os
+import random
+import glob
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import torchvision
 import timm
 import torch
@@ -172,6 +180,56 @@ def get_dataset() -> Tuple[TrainDataSet, ValidationDataSet]:
     )
 
 
+class DatasetGeneral(torch.utils.data.Dataset):
+    def __init__(
+        self,
+        images_wild,
+        transform,
+        n_im_per_epoch=2000,
+        aug=None,
+    ):
+        self.im_paths = glob.glob(images_wild)
+        self.transform = transform
+        self.aug = aug
+        self.len = n_im_per_epoch
+
+    def __len__(self):
+        return self.len
+
+    def __getitem__(self, _):
+        idx = random.randint(0, len(self.im_paths) - 1)
+        p = self.im_paths[idx]
+
+        im_orig = cv2.imread(p)
+        im_orig = cv2.cvtColor(im_orig, cv2.COLOR_BGR2RGB)
+
+        if self.aug is not None:
+            im_orig = self.aug(image=im_orig)["image"]
+        im_small = cv2.resize(
+            im_orig.copy(),
+            (im_orig.shape[1] // 4, im_orig.shape[0] // 4),
+            # interpolation=random.randint(0, 4),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        im_orig = self.transform(image=im_orig)["image"]
+        im_small = self.transform(image=im_small)["image"]
+
+        return im_small, im_orig
+
+
+def seedme(seed):
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.benchmark = False
+
+
 # Learning
 # Train the defined model with pytorch.
 # Adjust batch size and other parameters according to the VRAM of your GPU.
@@ -186,8 +244,8 @@ def train():
         project="signate-superres-1374",
         # group=,
         entity="petrdvoracek",
-        config=dict(model_id="1_custom"),
-        name=f"1_custom",
+        config=dict(model_id=NAME),
+        name=NAME,
     )
 
     def calc_psnr(image1: Tensor, image2: Tensor):
@@ -206,7 +264,22 @@ def train():
     model.to(device)
     writer = SummaryWriter("log")
 
+    transform_for_net = A.Compose([A.ToFloat(), ToTensorV2()])
+    augmentation = A.Compose(
+        [
+            # A.PadIfNeeded(512, 512, always_apply=True),
+            A.RandomCrop(512, 512),
+            A.HorizontalFlip(),
+            A.VerticalFlip(),
+        ]
+    )
     train_dataset, validation_dataset = get_dataset()
+    train_dataset = DatasetGeneral(
+        "/datasets/superres/*/*",
+        transform=transform_for_net,
+        aug=augmentation,
+        n_im_per_epoch=850 * 10,
+    )
     train_data_loader = data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -377,6 +450,7 @@ def calc_and_print_PSNR():
 
 
 if __name__ == "__main__":
+    seedme(42)
     train()
     inference_onnxruntime()
     calc_and_print_PSNR()
