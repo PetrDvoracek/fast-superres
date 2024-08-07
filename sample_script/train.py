@@ -11,7 +11,7 @@
 
 # training parameters
 
-NAME = "0_sample_div2k+flickr2k"
+NAME = "0_sample_defaultinit"
 
 # %%
 batch_size = 64
@@ -47,6 +47,7 @@ from abc import ABC, abstractmethod
 import cv2
 from tqdm import tqdm
 import wandb
+import imagesize
 
 
 # Structure definition of the 4x magnified sample model (ESPCN)
@@ -62,32 +63,20 @@ class ESPCN4x(nn.Module):
         self.conv_1 = nn.Conv2d(
             in_channels=1, out_channels=64, kernel_size=5, padding=2
         )
-        nn.init.normal_(self.conv_1.weight, mean=0, std=0.001)
-        nn.init.zeros_(self.conv_1.bias)
-
         self.act = nn.ReLU()
 
         self.conv_2 = nn.Conv2d(
             in_channels=64, out_channels=32, kernel_size=3, padding=1
         )
-        nn.init.normal_(self.conv_2.weight, mean=0, std=0.001)
-        nn.init.zeros_(self.conv_2.bias)
-
         self.conv_3 = nn.Conv2d(
             in_channels=32, out_channels=32, kernel_size=3, padding=1
         )
-        nn.init.normal_(self.conv_3.weight, mean=0, std=0.001)
-        nn.init.zeros_(self.conv_3.bias)
-
         self.conv_4 = nn.Conv2d(
             in_channels=32,
             out_channels=(1 * self.scale * self.scale),
             kernel_size=3,
             padding=1,
         )
-        nn.init.normal_(self.conv_4.weight, mean=0, std=0.001)
-        nn.init.zeros_(self.conv_4.bias)
-
         self.pixel_shuffle = nn.PixelShuffle(self.scale)
 
     def forward(self, X_in: tensor) -> tensor:
@@ -110,85 +99,15 @@ class ESPCN4x(nn.Module):
 # Since the evaluation images are provided in sets of high and low resolution, the low resolution image is used as the input image and the high resolution image is used as the correct image (ValidationDataSet).
 
 
-class DataSetBase(data.Dataset, ABC):
-    def __init__(self, image_path: Path):
-        self.images = list(image_path.iterdir())
-        self.max_num_sample = len(self.images)
-
-    def __len__(self) -> int:
-        return self.max_num_sample
-
-    @abstractmethod
-    def get_low_resolution_image(self, image: Image, path: Path) -> Image:
-        pass
-
-    def preprocess_high_resolution_image(self, image: Image) -> Image:
-        return image
-
-    def __getitem__(self, index) -> Tuple[Tensor, Tensor]:
-        image_path = self.images[index % len(self.images)]
-        high_resolution_image = self.preprocess_high_resolution_image(
-            PIL.Image.open(image_path)
-        )
-        low_resolution_image = self.get_low_resolution_image(
-            high_resolution_image, image_path
-        )
-        return transforms.ToTensor()(low_resolution_image), transforms.ToTensor()(
-            high_resolution_image
-        )
-
-
-class TrainDataSet(DataSetBase):
-    def __init__(self, image_path: Path, num_image_per_epoch: int = 2000):
-        super().__init__(image_path)
-        self.max_num_sample = num_image_per_epoch
-
-    def get_low_resolution_image(self, image: Image, path: Path) -> Image:
-        return transforms.Resize(
-            (image.size[0] // 4, image.size[1] // 4),
-            transforms.InterpolationMode.BICUBIC,
-        )(image.copy())
-
-    def preprocess_high_resolution_image(self, image: Image) -> Image:
-        return transforms.Compose(
-            [
-                transforms.RandomCrop(size=512),
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-            ]
-        )(image)
-
-
-class ValidationDataSet(DataSetBase):
-    def __init__(
-        self, high_resolution_image_path: Path, low_resolution_image_path: Path
-    ):
-        super().__init__(high_resolution_image_path)
-        self.high_resolution_image_path = high_resolution_image_path
-        self.low_resolution_image_path = low_resolution_image_path
-
-    def get_low_resolution_image(self, image: Image, path: Path) -> Image:
-        return PIL.Image.open(
-            self.low_resolution_image_path
-            / path.relative_to(self.high_resolution_image_path)
-        )
-
-
-def get_dataset() -> Tuple[TrainDataSet, ValidationDataSet]:
-    return TrainDataSet(Path("./dataset/train"), 850 * 10), ValidationDataSet(
-        Path("./dataset/validation/original"), Path("./dataset/validation/0.25x")
-    )
-
-
 class DatasetGeneral(torch.utils.data.Dataset):
     def __init__(
         self,
-        images_wild,
+        im_paths,
         transform,
         n_im_per_epoch=2000,
         aug=None,
     ):
-        self.im_paths = glob.glob(images_wild)
+        self.im_paths = im_paths
         self.transform = transform
         self.aug = aug
         self.len = n_im_per_epoch
@@ -200,22 +119,44 @@ class DatasetGeneral(torch.utils.data.Dataset):
         idx = random.randint(0, len(self.im_paths) - 1)
         p = self.im_paths[idx]
 
-        im_orig = cv2.imread(p)
-        im_orig = cv2.cvtColor(im_orig, cv2.COLOR_BGR2RGB)
+        im_orig = PIL.Image.open(p)
 
         if self.aug is not None:
-            im_orig = self.aug(image=im_orig)["image"]
-        im_small = cv2.resize(
-            im_orig.copy(),
-            (im_orig.shape[1] // 4, im_orig.shape[0] // 4),
-            # interpolation=random.randint(0, 4),
-            interpolation=cv2.INTER_CUBIC,
-        )
+            im_orig = self.aug(im_orig)
 
-        im_orig = self.transform(image=im_orig)["image"]
-        im_small = self.transform(image=im_small)["image"]
+        im_small = transforms.Resize(
+            (im_orig.size[0] // 4, im_orig.size[1] // 4),
+            transforms.InterpolationMode.BICUBIC,
+        )(im_orig.copy())
+
+        im_orig = transforms.ToTensor()(im_orig)
+        im_small = transforms.ToTensor()(im_small)
 
         return im_small, im_orig
+
+
+class DatasetValSignate(torch.utils.data.Dataset):
+    def __init__(
+        self, images_small_Wild, transform, small_id="0.25x", orig_id="original"
+    ):
+        self.im_small_paths = glob.glob(images_small_Wild)
+        self.im_orig_paths = [x.replace(small_id, orig_id) for x in self.im_small_paths]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.im_small_paths)
+
+    def __getitem__(self, idx):
+        im_small_p = self.im_small_paths[idx]
+        im_small = PIL.Image.open(im_small_p)
+
+        im_orig_p = self.im_orig_paths[idx]
+        im_orig = PIL.Image.open(im_orig_p)
+
+        return (
+            self.transform(im_small),
+            self.transform(im_orig),
+        )
 
 
 def seedme(seed):
@@ -264,22 +205,36 @@ def train():
     model.to(device)
     writer = SummaryWriter("log")
 
-    transform_for_net = A.Compose([A.ToFloat(), ToTensorV2()])
-    augmentation = A.Compose(
+    # transform_for_net = A.Compose([A.ToFloat(), ToTensorV2()])
+    # augmentation = A.Compose(
+    #     [
+    #         # A.PadIfNeeded(512, 512, always_apply=True),
+    #         A.RandomCrop(512, 512),
+    #         A.HorizontalFlip(),
+    #         A.VerticalFlip(),
+    #     ]
+    # )
+    preproc = transforms.ToTensor()
+    augmentation = transforms.Compose(
         [
-            # A.PadIfNeeded(512, 512, always_apply=True),
-            A.RandomCrop(512, 512),
-            A.HorizontalFlip(),
-            A.VerticalFlip(),
+            transforms.RandomCrop(size=512),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
         ]
     )
-    train_dataset, validation_dataset = get_dataset()
+    # train_dataset, validation_dataset = get_dataset()
+    in1k = glob.glob("/datasets/imagenet/val/*/*")
+    in1k_large = [x for x in in1k if min(imagesize.get(x)) > 512]
+    train_paths = (
+        glob.glob("/datasets/superres/*/*") + glob.glob("../train/*") + in1k_large
+    )
     train_dataset = DatasetGeneral(
-        "/datasets/superres/*/*",
-        transform=transform_for_net,
+        train_paths,
+        transform=preproc,
         aug=augmentation,
         n_im_per_epoch=850 * 10,
     )
+    validation_dataset = DatasetValSignate("../validation/0.25x/*", transform=preproc)
     train_data_loader = data.DataLoader(
         train_dataset,
         batch_size=batch_size,
