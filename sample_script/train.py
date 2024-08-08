@@ -11,12 +11,12 @@
 
 # training parameters
 
-NAME = "0_sample_defaultinit"
+NAME = "1_in1kval+div+flickr+signate"
 
 # %%
 batch_size = 64
 num_workers = 16
-num_epoch = 100
+num_epoch = 250
 learning_rate = 1e-3
 
 import os
@@ -49,30 +49,29 @@ from tqdm import tqdm
 import wandb
 import imagesize
 
+# import basicsr
 
-# Structure definition of the 4x magnified sample model (ESPCN)
+
 # Reference https://github.com/Nhat-Thanh/ESPCN-Pytorch
 # The inputs to the model are assumed to be 4-dimensional inputs in N, C, H, W, with channels in the order R, G, B and pixel values normalized to 0~1.
 # The output will also be in the same format, with 4x vertical and horizontal resolution (H, W).
-
-
 class ESPCN4x(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.scale = 4
         self.conv_1 = nn.Conv2d(
-            in_channels=1, out_channels=64, kernel_size=5, padding=2
+            in_channels=1, out_channels=96, kernel_size=7, padding=3
         )
         self.act = nn.ReLU()
 
         self.conv_2 = nn.Conv2d(
-            in_channels=64, out_channels=32, kernel_size=3, padding=1
+            in_channels=96, out_channels=48, kernel_size=3, padding=1
         )
         self.conv_3 = nn.Conv2d(
-            in_channels=32, out_channels=32, kernel_size=3, padding=1
+            in_channels=48, out_channels=48, kernel_size=3, padding=1
         )
         self.conv_4 = nn.Conv2d(
-            in_channels=32,
+            in_channels=48,
             out_channels=(1 * self.scale * self.scale),
             kernel_size=3,
             padding=1,
@@ -87,16 +86,9 @@ class ESPCN4x(nn.Module):
         X = self.conv_4(X)
         X = self.pixel_shuffle(X)
         X = X.reshape(-1, 3, X.shape[-2], X.shape[-1])
+        # replace with sigmoid, image is lost
         X_out = clip(X, 0.0, 1.0)
         return X_out
-
-
-# %%
-
-# Data set definition
-# This class reads the provided training and evaluation image sets (high resolution + low resolution).
-# The training image is a 512px square cut from the original image and is used as the correct image. The correct image is also used as the input image (TrainDataSet), which is a 1/4 size smaller than the correct image.
-# Since the evaluation images are provided in sets of high and low resolution, the low resolution image is used as the input image and the high resolution image is used as the correct image (ValidationDataSet).
 
 
 class DatasetGeneral(torch.utils.data.Dataset):
@@ -119,7 +111,7 @@ class DatasetGeneral(torch.utils.data.Dataset):
         idx = random.randint(0, len(self.im_paths) - 1)
         p = self.im_paths[idx]
 
-        im_orig = PIL.Image.open(p)
+        im_orig = PIL.Image.open(p).convert("RGB")
 
         if self.aug is not None:
             im_orig = self.aug(im_orig)
@@ -148,10 +140,10 @@ class DatasetValSignate(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         im_small_p = self.im_small_paths[idx]
-        im_small = PIL.Image.open(im_small_p)
+        im_small = PIL.Image.open(im_small_p).convert("RGB")
 
         im_orig_p = self.im_orig_paths[idx]
-        im_orig = PIL.Image.open(im_orig_p)
+        im_orig = PIL.Image.open(im_orig_p).convert("RGB")
 
         return (
             self.transform(im_small),
@@ -171,23 +163,15 @@ def seedme(seed):
     torch.backends.cudnn.benchmark = False
 
 
-# Learning
-# Train the defined model with pytorch.
-# Adjust batch size and other parameters according to the VRAM of your GPU.
-# The logs of the training are saved in the log folder.
-# After learning, torch.onnx.export is called to convert the model to an ONNX model.
-# In this case, set dynamic_axes so that opset=17, the model input name is input, the model output name is output, and the model input shape is (1, 3, height, width).
-# (In this example, after setting dummy input of (1, 3, 128, 128), set dynamic_axes to shape[2] and shape[3] so that the input shape of the model is (1, 3, height, width).
+def luma(b):
+    b[:, 0, ...] = b[:, 0, ...] * 0.299
+    b[:, 1, ...] = b[:, 1, ...] * 0.587
+    b[:, 2, ...] = b[:, 2, ...] * 0.114
+    return b
+
+
 def train():
     to_image = transforms.ToPILImage()
-
-    wandb.init(
-        project="signate-superres-1374",
-        # group=,
-        entity="petrdvoracek",
-        config=dict(model_id=NAME),
-        name=NAME,
-    )
 
     def calc_psnr(image1: Tensor, image2: Tensor):
         image1 = cv2.cvtColor(
@@ -199,21 +183,12 @@ def train():
 
         return cv2.PSNR(image1, image2)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda"
 
     model = ESPCN4x()
     model.to(device)
-    writer = SummaryWriter("log")
+    # model.load_state_dict(torch.load("models/1_in1kval+div+flickr+signate-250.pth"))
 
-    # transform_for_net = A.Compose([A.ToFloat(), ToTensorV2()])
-    # augmentation = A.Compose(
-    #     [
-    #         # A.PadIfNeeded(512, 512, always_apply=True),
-    #         A.RandomCrop(512, 512),
-    #         A.HorizontalFlip(),
-    #         A.VerticalFlip(),
-    #     ]
-    # )
     preproc = transforms.ToTensor()
     augmentation = transforms.Compose(
         [
@@ -223,11 +198,17 @@ def train():
         ]
     )
     # train_dataset, validation_dataset = get_dataset()
-    in1k = glob.glob("/datasets/imagenet/val/*/*")
-    in1k_large = [x for x in in1k if min(imagesize.get(x)) > 512]
+    in1k_val = glob.glob("/datasets/imagenet/val/*/*")
+    in1k_val_large = [x for x in in1k_val if min(imagesize.get(x)) > 512]
+    in1k_train = glob.glob("/datasets/imagenet/train/*/*")
+    in1k_train_large = [x for x in in1k_train if min(imagesize.get(x)) > 512]
     train_paths = (
-        glob.glob("/datasets/superres/*/*") + glob.glob("../train/*") + in1k_large
+        glob.glob("/datasets/superres/*/*")
+        + glob.glob("../train/*")
+        + in1k_val_large
+        + in1k_train_large
     )
+    print(f"n images: {len(train_paths)}")
     train_dataset = DatasetGeneral(
         train_paths,
         transform=preproc,
@@ -246,13 +227,31 @@ def train():
         validation_dataset, batch_size=1, shuffle=False, num_workers=num_workers
     )
 
-    optimizer = Adam(model.parameters(), lr=learning_rate)
-    scheduler = MultiStepLR(optimizer, milestones=[30, 50, 65, 80, 90], gamma=0.7)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scheduler = MultiStepLR(
+        optimizer,
+        milestones=[
+            int(0.3 * num_epoch),
+            int(0.5 * num_epoch),
+            int(0.65 * num_epoch),
+            int(0.8 * num_epoch),
+            int(0.9 * num_epoch),
+            int(0.95 * num_epoch),
+            int(0.97 * num_epoch),
+        ],
+        gamma=0.7,
+    )
     criterion = MSELoss()
 
+    wandb.init(
+        project="signate-superres-1374",
+        # group=,
+        entity="petrdvoracek",
+        config=dict(model_id=NAME),
+        name=NAME,
+    )
     for epoch in trange(num_epoch, desc="EPOCH"):
         try:
-            # 学習
             model.train()
             train_loss = 0.0
             validation_loss = 0.0
@@ -272,6 +271,12 @@ def train():
                 train_loss += loss.item() * low_resolution_image.size(0)
                 for image1, image2 in zip(output, high_resolution_image):
                     train_psnr += calc_psnr(image1, image2)
+
+                # luma_mse = torch.sum(
+                #     (luma(output.detach()) - luma(high_resolution_image.detach())) ** 2
+                # )
+                # psnr = 20 * torch.log10(1.0 / torch.sqrt(luma_mse))
+                # train_psnr.append(psnr)
                 optimizer.step()
             scheduler.step()
 
@@ -299,19 +304,22 @@ def train():
                     "examples": wandb.Image(output[:8], caption="asd"),
                 }
             )
+            if epoch % 10 == 0 or epoch > num_epoch-10:
+                torch.save(model.state_dict(), f"models/{NAME}-{epoch}.pth")
         except Exception as ex:
             print(f"EPOCH[{epoch}] ERROR: {ex}")
+            raise
 
-    writer.close()
+        torch.save(model.state_dict(), f"models/{NAME}.pth")
 
-    torch.save(model.state_dict(), "model.pth")
+    torch.save(model.state_dict(), f"models/{NAME}-final.pth")
 
     model.to(torch.device("cpu"))
     dummy_input = torch.randn(1, 3, 128, 128, device="cpu")
     torch.onnx.export(
         model,
         dummy_input,
-        "model.onnx",
+        "models/{NAME}.onnx",
         opset_version=17,
         input_names=["input"],
         output_names=["output"],
