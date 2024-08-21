@@ -1,22 +1,11 @@
-# Sample scripts for training and model generation
-# Same contents as notebook(train.ipynb)
-# Please refer to the README to set up the environment in advance and place the dataset you have obtained in the following format
-# train.py
-# dataset/ # dataset you are distributing
-# + train/
-# + validation/
-# + 0.25x/
-# + original/
+# Reference https://github.com/Nhat-Thanh/ESPCN-Pytorch
 
-
-# training parameters
-
-NAME = "1_in1kval+div+flickr+signate"
+NAME = "2_japan+in1k+div+flickr+signate"
 
 # %%
 batch_size = 64
-num_workers = 16
-num_epoch = 250
+num_workers = 8
+num_epoch = 500
 learning_rate = 1e-3
 
 import os
@@ -49,29 +38,30 @@ from tqdm import tqdm
 import wandb
 import imagesize
 
-# import basicsr
 
-
+# Structure definition of the 4x magnified sample model (ESPCN)
 # Reference https://github.com/Nhat-Thanh/ESPCN-Pytorch
 # The inputs to the model are assumed to be 4-dimensional inputs in N, C, H, W, with channels in the order R, G, B and pixel values normalized to 0~1.
 # The output will also be in the same format, with 4x vertical and horizontal resolution (H, W).
+
+
 class ESPCN4x(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.scale = 4
         self.conv_1 = nn.Conv2d(
-            in_channels=1, out_channels=96, kernel_size=7, padding=3
+            in_channels=1, out_channels=64, kernel_size=5, padding=2
         )
         self.act = nn.ReLU()
 
         self.conv_2 = nn.Conv2d(
-            in_channels=96, out_channels=48, kernel_size=3, padding=1
+            in_channels=64, out_channels=32, kernel_size=3, padding=1
         )
         self.conv_3 = nn.Conv2d(
-            in_channels=48, out_channels=48, kernel_size=3, padding=1
+            in_channels=32, out_channels=32, kernel_size=3, padding=1
         )
         self.conv_4 = nn.Conv2d(
-            in_channels=48,
+            in_channels=32,
             out_channels=(1 * self.scale * self.scale),
             kernel_size=3,
             padding=1,
@@ -79,6 +69,7 @@ class ESPCN4x(nn.Module):
         self.pixel_shuffle = nn.PixelShuffle(self.scale)
 
     def forward(self, X_in: tensor) -> tensor:
+
         X = X_in.reshape(-1, 1, X_in.shape[-2], X_in.shape[-1])
         X = self.act(self.conv_1(X))
         X = self.act(self.conv_2(X))
@@ -87,6 +78,8 @@ class ESPCN4x(nn.Module):
         X = self.pixel_shuffle(X)
         X = X.reshape(-1, 3, X.shape[-2], X.shape[-1])
         # replace with sigmoid, image is lost
+        base = torch.nn.functional.interpolate(X_in, scale_factor=self.scale, mode='bicubic')
+        X = base + X
         X_out = clip(X, 0.0, 1.0)
         return X_out
 
@@ -203,7 +196,8 @@ def train():
     in1k_train = glob.glob("/datasets/imagenet/train/*/*")
     in1k_train_large = [x for x in in1k_train if min(imagesize.get(x)) > 512]
     train_paths = (
-        glob.glob("/datasets/superres/*/*")
+        glob.glob("/datasets/japan_160k/*/*")
+        + glob.glob("/datasets/superres/*/*")
         + glob.glob("../train/*")
         + in1k_val_large
         + in1k_train_large
@@ -251,6 +245,7 @@ def train():
         name=NAME,
     )
     for epoch in trange(num_epoch, desc="EPOCH"):
+        should_calc_psnr = (epoch % 10 == 0) or (epoch > epoch - 10)
         try:
             model.train()
             train_loss = 0.0
@@ -269,8 +264,9 @@ def train():
                 loss = criterion(output, high_resolution_image)
                 loss.backward()
                 train_loss += loss.item() * low_resolution_image.size(0)
-                for image1, image2 in zip(output, high_resolution_image):
-                    train_psnr += calc_psnr(image1, image2)
+                if should_calc_psnr:
+                    for image1, image2 in zip(output, high_resolution_image):
+                        train_psnr += calc_psnr(image1, image2)
 
                 # luma_mse = torch.sum(
                 #     (luma(output.detach()) - luma(high_resolution_image.detach())) ** 2
@@ -292,18 +288,24 @@ def train():
                     output = model(low_resolution_image)
                     loss = criterion(output, high_resolution_image)
                     validation_loss += loss.item() * low_resolution_image.size(0)
-                    for image1, image2 in zip(output, high_resolution_image):
-                        validation_psnr += calc_psnr(image1, image2)
+                    if should_calc_psnr:
+                        for image1, image2 in zip(output, high_resolution_image):
+                            validation_psnr += calc_psnr(image1, image2)
             wandb.log(
                 {
                     "epoch": epoch,
                     "train_loss": train_loss / len(train_dataset),
-                    "train_psnr": train_psnr / len(train_dataset),
                     "val_loss": validation_loss / len(validation_dataset),
-                    "val_psnr": validation_psnr / len(validation_dataset),
                     "examples": wandb.Image(output[:8], caption="asd"),
                 }
             )
+            if should_calc_psnr:
+                wandb.log(
+                    {
+                        "train_psnr": train_psnr / len(train_dataset),
+                        "val_psnr": validation_psnr / len(validation_dataset),
+                    }
+                )
             if epoch % 10 == 0 or epoch > num_epoch-10:
                 torch.save(model.state_dict(), f"models/{NAME}-{epoch}.pth")
         except Exception as ex:
@@ -319,7 +321,7 @@ def train():
     torch.onnx.export(
         model,
         dummy_input,
-        "models/{NAME}.onnx",
+        f"models/{NAME}.onnx",
         opset_version=17,
         input_names=["input"],
         output_names=["output"],
