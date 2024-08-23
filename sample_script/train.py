@@ -3,6 +3,7 @@ import os
 import random
 import glob
 import copy
+import time
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ import cv2
 import PIL
 import imagesize
 import click
+import kornia.augmentation as KA
+import kornia as K
 
 
 def seedme(seed):
@@ -50,7 +53,7 @@ class ESPCN4x(torch.nn.Module):
         super().__init__()
         self.scale = 4
         self.conv_1 = torch.nn.Conv2d(
-            in_channels=1, out_channels=64, kernel_size=5, padding=2
+            in_channels=3, out_channels=64, kernel_size=5, padding=2
         )
         self.act = torch.nn.ReLU()
         self.conv_2 = torch.nn.Conv2d(
@@ -61,7 +64,7 @@ class ESPCN4x(torch.nn.Module):
         )
         self.conv_4 = torch.nn.Conv2d(
             in_channels=32,
-            out_channels=(1 * self.scale * self.scale),
+            out_channels=(3 * self.scale * self.scale),
             kernel_size=3,
             padding=1,
         )
@@ -69,16 +72,16 @@ class ESPCN4x(torch.nn.Module):
 
     def forward(self, batch):
         base = torch.nn.functional.interpolate(
-            copy.deepcopy(batch), scale_factor=self.scale, mode="bicubic"
+            batch, scale_factor=self.scale, mode="bicubic"
         )
-        x = batch.reshape(-1, 1, batch.shape[-2], batch.shape[-1])
-        x = self.act(self.conv_1(x))
+
+        x = self.act(self.conv_1(batch))
         x = self.act(self.conv_2(x))
         x = self.act(self.conv_3(x))
         x = self.conv_4(x)
         x = self.pixel_shuffle(x)
-        x = x.reshape(-1, 3, x.shape[-2], x.shape[-1])
         x = base + x
+
         X_out = torch.clip(x, 0.0, 1.0)
         return X_out
 
@@ -99,7 +102,7 @@ class DatasetGeneral(torch.utils.data.Dataset):
         ds = self.im_paths2d[ds_idx]
         im_idx = random.randint(0, len(ds) - 1)
         p = ds[im_idx]
-        im_orig = PIL.Image.open(p).convert("RGB")
+        im_orig = PIL.Image.open(p)
         if self.aug is not None:
             im_orig = self.aug(im_orig)
         im_small = T.Resize(
@@ -134,9 +137,9 @@ class DatasetValSignate(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         im_small_p = self.im_small_paths[idx]
-        im_small = PIL.Image.open(im_small_p).convert("RGB")
+        im_small = PIL.Image.open(im_small_p)
         im_orig_p = self.im_orig_paths[idx]
-        im_orig = PIL.Image.open(im_orig_p).convert("RGB")
+        im_orig = PIL.Image.open(im_orig_p)
         return (self.preproc(im_small), self.preproc(im_orig))
 
 
@@ -165,11 +168,11 @@ def train(
     scaler = torch.cuda.amp.GradScaler()
 
     for epoch in tqdm.trange(num_epochs, desc="EPOCH"):
-        should_calc_psnr = (epoch % 10 == 0) or (epoch > epoch - 10)
+        always_calc_psnr = epoch > epoch - 10
 
         model.train()
         train_loss = 0.0
-        train_psnr = 0.0
+        train_psnr = []
         for low_res, high_res in tqdm.tqdm(
             train_loader, desc=f"EPOCH[{epoch}] TRAIN", total=len(train_loader)
         ):
@@ -183,14 +186,14 @@ def train(
             scaler.step(optimizer)
             scaler.update()
             train_loss += loss.item() * low_res.size(0)
-            if should_calc_psnr:
+            if always_calc_psnr or (random.random() < 0.2):
                 for img1, img2 in zip(output, high_res):
-                    train_psnr += calc_psnr(img1, img2)
+                    train_psnr.append(calc_psnr(img1, img2))
         scheduler.step()
 
         model.eval()
         val_loss = 0.0
-        val_psnr = 0.0
+        val_psnr = []
         with torch.no_grad():
             for low_res, high_res in tqdm.tqdm(
                 val_loader, desc=f"EPOCH[{epoch}] VALIDATION", total=len(val_loader)
@@ -201,17 +204,17 @@ def train(
                     output = model(low_res)
                     loss = criterion(output, high_res)
                 val_loss += loss.item() * low_res.size(0)
-                if should_calc_psnr:
+                if always_calc_psnr or (random.random() < 0.2):
                     for img1, img2 in zip(output, high_res):
-                        val_psnr += calc_psnr(img1, img2)
+                        val_psnr.append(calc_psnr(img1, img2))
 
         wandb.log(
             {
                 "epoch": epoch,
                 "train_loss": train_loss / len(train_loader.dataset),
                 "val_loss": val_loss / len(val_loader.dataset),
-                "train_psnr": train_psnr / len(train_loader.dataset),
-                "val_psnr": val_psnr / len(val_loader.dataset),
+                "train_psnr": sum(train_psnr) / len(train_psnr),
+                "val_psnr": sum(val_psnr) / len(val_psnr),
             }
         )
         if log_image:
@@ -239,6 +242,28 @@ def train(
         dynamic_axes={"input": {2: "height", 3: "width"}},
     )
 
+class Augmentation(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.t = torch.nn.Sequential(
+                KA.RandomCrop(512),
+                KA.RandomHorizontalFlip(),
+                KA.RandomVerticalFlip(),
+        )
+    def forward(self, x):
+        return self.t(x)
+
+class PreProcess(nn.Module):
+    """Module to perform pre-process using Kornia on torch tensors."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    @torch.no_grad()  # disable gradients for effiency
+    def forward(self, x) -> torch.Tensor:
+        x_tmp: np.ndarray = np.array(x)  # HxWxC
+        x_out: torch.Tensor = K.image_to_tensor(x_tmp, keepdim=True)  # CxHxW
+        return x_out.float()
 
 @click.command()
 @click.argument("NAME")
@@ -251,16 +276,18 @@ def main(name, batch_size, num_workers, num_epochs, lr, log_image):
     seedme(42)
 
     # train_dataset, validation_dataset = get_dataset()
-    # in1k_val = glob.glob("/datasets/imagenet/val/*/*")
-    # in1k_val_large = [x for x in in1k_val if min(imagesize.get(x)) > 512]
-    # in1k_train = glob.glob("/datasets/imagenet/train/*/*")
-    # in1k_train_large = [x for x in in1k_train if min(imagesize.get(x)) > 512]
+    in1k_val = glob.glob("/datasets/imagenet/val/*/*")
+    in1k_val_large = [x for x in in1k_val if min(imagesize.get(x)) > 512]
+    in1k_train = glob.glob("/datasets/imagenet/train/*/*")
+    in1k_train_large = [x for x in in1k_train if min(imagesize.get(x)) > 512]
     train_paths = [
         glob.glob("/datasets/japan_160k/*/*"),
         glob.glob("/datasets/superres/*/*"),
         glob.glob("../train/*"),
-        # in1k_val_large,
-        # in1k_train_large,
+        # glob.glob("/dev/shm/superres/*/*"),
+        # glob.glob("/dev/shm/train/*"),
+        in1k_val_large,
+        in1k_train_large,
     ]
     # just flattening the list
     print(f"n images: {len([el for sublist in train_paths for el in sublist])}")
@@ -287,7 +314,7 @@ def main(name, batch_size, num_workers, num_epochs, lr, log_image):
         pin_memory=True,
     )
     val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=1, shuffle=False, num_workers=num_workers
+        val_dataset, batch_size=1, shuffle=False, num_workers=num_workers, pin_memory=True
     )
 
     model = ESPCN4x()
